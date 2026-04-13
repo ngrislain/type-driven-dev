@@ -11,7 +11,7 @@ package «type-driven-dev» where
   version := v!"0.1.0"
 
 require hale from git
-  "https://github.com/typednotes/hale.git" @ "v0.3.0"
+  "https://github.com/typednotes/hale.git" @ "v0.3.1"
 
 lean_lib TypeDrivenDev
 
