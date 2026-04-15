@@ -148,6 +148,7 @@ def costlySub (a b : Int) : Costly Int 1 := ⟨a - b⟩
 /-- Costly integer multiplication: cost 100. -/
 def costlyMul (a b : Int) : Costly Int 100 := ⟨a * b⟩
 
+
 -- Mixed-type instances (Int×Nat, Nat×Int) are non-scoped since they don't
 -- conflict with stdlib (which only defines HAdd T T T for same types).
 -- These handle the common case of `x + 5` where x:Int comes from a bind.
@@ -304,6 +305,188 @@ def costlyMatMul (A : Matrix n k) (B : Matrix k m)
 instance : HMul (Matrix n k) (Matrix k m) (Costly (Matrix n m) (((101 * k) * m) * n)) where
   hMul := costlyMatMul
 
+/-- Cheaper dot product: skips the redundant addition-to-zero.
+    For k=0 we return 0 (cost 0).  For k=1 we return the single product
+    (cost 100 = 101·1 − 1).  For k+2 the recursive step adds 101,
+    and Lean's kernel checks 101·(k+1)−1 + 101 ≡ 101·(k+2)−1 definitionally. -/
+def cheaperDot : (k : Nat) → (Fin k → Int) → (Fin k → Int) → Costly Int (101 * k - 1)
+  | 0, _, _ => Costly.pure 0
+  | 1, a, b => costlyMul (a (Fin.last 0)) (b (Fin.last 0))
+  | k+2, a, b =>
+    (cheaperDot (k+1) (fun i => a i.castSucc) (fun i => b i.castSucc)).bind fun rest =>
+    (costlyMul (a (Fin.last (k+1))) (b (Fin.last (k+1)))).bind fun prod =>
+    costlyAdd rest prod
+
+/-- (a − 1) * b ≤ a * b − 1 for all naturals. -/
+private theorem sub_one_mul_le (a b : Nat) : (a - 1) * b ≤ a * b - 1 := by
+  rcases a with _ | a
+  · simp
+  · rcases b with _ | b
+    · simp
+    · simp only [Nat.succ_sub_one, Nat.succ_mul]
+      omega
+
+/-- Cheaper matrix multiplication: uses `cheaperDot` which saves one addition
+    per dot product, then relaxes into the target budget.
+    Cost: ((101 * k) * m) * n − 1. -/
+def cheaperMatMul' (A : Matrix n k) (B : Matrix k m)
+    : Costly (Matrix n m) (((101 * k) * m) * n - 1) :=
+  ((costlyTabulate n fun i =>
+    costlyTabulate m fun j =>
+      cheaperDot k (A.get i) (fun l => B.get l j)).map Matrix.mk).relax (by
+    calc ((101 * k - 1) * m) * n
+        ≤ ((101 * k) * m - 1) * n := Nat.mul_le_mul_right n (sub_one_mul_le (101 * k) m)
+      _ ≤ ((101 * k) * m) * n - 1 := sub_one_mul_le ((101 * k) * m) n)
+
+/-- Strassen multiplication for 2×2 · 2×2 matrices.
+    Uses 7 multiplications (cost 700) + 18 additions/subtractions (cost 18)
+    = 718, versus the standard 8 muls + 4 adds = 808.
+    Saving one multiplication at the 100:1 cost ratio is a net win of 90. -/
+def strassenMul (A : Matrix 2 2) (B : Matrix 2 2) : Costly (Matrix 2 2) 718 := cdo
+  -- Extract elements (pure, cost 0)
+  let a := A.get 0 0; let b := A.get 0 1
+  let c := A.get 1 0; let d := A.get 1 1
+  let e := B.get 0 0; let f := B.get 0 1
+  let g := B.get 1 0; let h := B.get 1 1
+  -- 10 input sums (cost 10)
+  let ad  ← costlyAdd a d;  let eh ← costlyAdd e h
+  let cd  ← costlyAdd c d;  let fh ← costlySub f h
+  let ge  ← costlySub g e;  let ab ← costlyAdd a b
+  let ca  ← costlySub c a;  let ef ← costlyAdd e f
+  let bd  ← costlySub b d;  let gh ← costlyAdd g h
+  -- 7 multiplications (cost 700)
+  let m1 ← costlyMul ad eh   -- (a+d)(e+h)
+  let m2 ← costlyMul cd e    -- (c+d)·e
+  let m3 ← costlyMul a  fh   -- a·(f−h)
+  let m4 ← costlyMul d  ge   -- d·(g−e)
+  let m5 ← costlyMul ab h    -- (a+b)·h
+  let m6 ← costlyMul ca ef   -- (c−a)(e+f)
+  let m7 ← costlyMul bd gh   -- (b−d)(g+h)
+  -- 8 output combinations (cost 8)
+  let t1  ← costlyAdd m1 m4
+  let t2  ← costlySub t1 m5
+  let c00 ← costlyAdd t2 m7  -- M1+M4−M5+M7
+  let c01 ← costlyAdd m3 m5  -- M3+M5
+  let c10 ← costlyAdd m2 m4  -- M2+M4
+  let t3  ← costlySub m1 m2
+  let t4  ← costlyAdd t3 m3
+  let c11 ← costlyAdd t4 m6  -- M1−M2+M3+M6
+  return ⟨fun i j =>
+    if i.val = 0 then (if j.val = 0 then c00 else c01)
+    else (if j.val = 0 then c10 else c11)⟩
+
+/-- Strassen–Winograd variant for 2×2 · 2×2 matrices.
+    Same 7 multiplications as Strassen, but reuses intermediate sums
+    to cut additions from 18 to 15.  Cost: 7 × 100 + 15 × 1 = 715. -/
+def strassenWinogradMul (A : Matrix 2 2) (B : Matrix 2 2)
+    : Costly (Matrix 2 2) 715 := cdo
+  let a₁₁ := A.get 0 0; let a₁₂ := A.get 0 1
+  let a₂₁ := A.get 1 0; let a₂₂ := A.get 1 1
+  let b₁₁ := B.get 0 0; let b₁₂ := B.get 0 1
+  let b₂₁ := B.get 1 0; let b₂₂ := B.get 1 1
+  -- 8 input sums (cost 8)
+  let s₁ ← costlyAdd a₂₁ a₂₂         -- a₂₁ + a₂₂
+  let s₂ ← costlySub s₁  a₁₁         -- a₂₁ + a₂₂ − a₁₁
+  let s₃ ← costlySub a₁₁ a₂₁         -- a₁₁ − a₂₁
+  let s₄ ← costlySub a₁₂ s₂          -- a₁₂ − s₂
+  let t₁ ← costlySub b₁₂ b₁₁         -- b₁₂ − b₁₁
+  let t₂ ← costlySub b₂₂ t₁          -- b₂₂ − t₁
+  let t₃ ← costlySub b₂₂ b₁₂         -- b₂₂ − b₁₂
+  let t₄ ← costlySub t₂  b₂₁         -- t₂ − b₂₁
+  -- 7 multiplications (cost 700)
+  let p₁ ← costlyMul a₁₁ b₁₁         -- a₁₁ · b₁₁
+  let p₂ ← costlyMul a₁₂ b₂₁         -- a₁₂ · b₂₁
+  let p₃ ← costlyMul s₄  b₂₂         -- s₄ · b₂₂
+  let p₄ ← costlyMul a₂₂ t₄          -- a₂₂ · t₄
+  let p₅ ← costlyMul s₁  t₁          -- s₁ · t₁
+  let p₆ ← costlyMul s₂  t₂          -- s₂ · t₂
+  let p₇ ← costlyMul s₃  t₃          -- s₃ · t₃
+  -- 7 output combinations (cost 7)
+  let u₁ ← costlyAdd p₁ p₂           -- c₁₁ = p₁ + p₂
+  let u₂ ← costlyAdd p₁ p₆           -- p₁ + p₆
+  let u₃ ← costlyAdd u₂ p₇           -- p₁ + p₆ + p₇
+  let u₄ ← costlyAdd u₂ p₅           -- p₁ + p₆ + p₅
+  let u₅ ← costlyAdd u₄ p₃           -- c₁₂ = p₁ + p₆ + p₅ + p₃
+  let u₆ ← costlySub u₃ p₄           -- c₂₁ = p₁ + p₆ + p₇ − p₄
+  let u₇ ← costlyAdd u₃ p₅           -- c₂₂ = p₁ + p₆ + p₇ + p₅
+  return ⟨fun i j =>
+    if i.val = 0 then (if j.val = 0 then u₁ else u₅)
+    else (if j.val = 0 then u₆ else u₇)⟩
+
+def cheaperMatMul (A : Matrix 2 2) (B : Matrix 2 2) : Costly (Matrix 2 2) 715 :=
+  strassenWinogradMul A B
+
+-- ============================================================================
+-- Part 5b: Recursive Strassen for 4×4 (two levels of 2×2 Strassen–Winograd)
+-- ============================================================================
+
+/-- Extract a 2×2 sub-block from a 4×4 matrix.
+    (br, bc) ∈ Fin 2 selects which quadrant. -/
+def Matrix.block (M : Matrix 4 4) (br bc : Fin 2) : Matrix 2 2 :=
+  ⟨fun i j => M.get ⟨br.val * 2 + i.val, by omega⟩ ⟨bc.val * 2 + j.val, by omega⟩⟩
+
+/-- Add two matrices element-wise. Cost: (1 * m) * n. -/
+def matAdd (A B : Matrix n m) : Costly (Matrix n m) ((1 * m) * n) :=
+  (costlyTabulate n fun i =>
+    costlyTabulate m fun j =>
+      costlyAdd (A.get i j) (B.get i j)).map Matrix.mk
+
+/-- Subtract two matrices element-wise. Cost: (1 * m) * n. -/
+def matSub (A B : Matrix n m) : Costly (Matrix n m) ((1 * m) * n) :=
+  (costlyTabulate n fun i =>
+    costlyTabulate m fun j =>
+      costlySub (A.get i j) (B.get i j)).map Matrix.mk
+
+/-- Assemble four 2×2 quadrants into a 4×4 matrix. -/
+def Matrix.assemble (c₁₁ c₁₂ c₂₁ c₂₂ : Matrix 2 2) : Matrix 4 4 :=
+  ⟨fun i j =>
+    if hi : i.val < 2 then
+      if hj : j.val < 2 then c₁₁.get ⟨i.val, hi⟩ ⟨j.val, hj⟩
+      else c₁₂.get ⟨i.val, hi⟩ ⟨j.val - 2, by omega⟩
+    else
+      if hj : j.val < 2 then c₂₁.get ⟨i.val - 2, by omega⟩ ⟨j.val, hj⟩
+      else c₂₂.get ⟨i.val - 2, by omega⟩ ⟨j.val - 2, by omega⟩⟩
+
+/-- Recursive Strassen for 4×4 · 4×4 matrices.
+    Splits into 2×2 blocks, applies Strassen–Winograd at both levels.
+    Level 1: 7 block-multiplies + 15 block-add/subs (each 2×2 = 4 ops)
+    Level 2: each block-multiply uses Strassen–Winograd (cost 715)
+    Total: 7 × 715 + 15 × 4 = 5005 + 60 = 5065
+    Standard costlyMatMul: ((101 × 4) × 4) × 4 = 6464 -/
+def strassenMul44 (A : Matrix 4 4) (B : Matrix 4 4)
+    : Costly (Matrix 4 4) 5065 := cdo
+  -- Extract 2×2 blocks (pure, cost 0)
+  let a₁₁ := A.block 0 0; let a₁₂ := A.block 0 1
+  let a₂₁ := A.block 1 0; let a₂₂ := A.block 1 1
+  let b₁₁ := B.block 0 0; let b₁₂ := B.block 0 1
+  let b₂₁ := B.block 1 0; let b₂₂ := B.block 1 1
+  -- 8 block input sums (each 2×2 add/sub = 4 ops, total 32)
+  let s₁ ← matAdd a₂₁ a₂₂
+  let s₂ ← matSub s₁  a₁₁
+  let s₃ ← matSub a₁₁ a₂₁
+  let s₄ ← matSub a₁₂ s₂
+  let t₁ ← matSub b₁₂ b₁₁
+  let t₂ ← matSub b₂₂ t₁
+  let t₃ ← matSub b₂₂ b₁₂
+  let t₄ ← matSub t₂  b₂₁
+  -- 7 block multiplications (each 715, total 5005)
+  let p₁ ← strassenWinogradMul a₁₁ b₁₁
+  let p₂ ← strassenWinogradMul a₁₂ b₂₁
+  let p₃ ← strassenWinogradMul s₄  b₂₂
+  let p₄ ← strassenWinogradMul a₂₂ t₄
+  let p₅ ← strassenWinogradMul s₁  t₁
+  let p₆ ← strassenWinogradMul s₂  t₂
+  let p₇ ← strassenWinogradMul s₃  t₃
+  -- 7 block output combinations (each 2×2 add/sub = 4 ops, total 28)
+  let u₁ ← matAdd p₁ p₂
+  let u₂ ← matAdd p₁ p₆
+  let u₃ ← matAdd u₂ p₇
+  let u₄ ← matAdd u₂ p₅
+  let u₅ ← matAdd u₄ p₃
+  let u₆ ← matSub u₃ p₄
+  let u₇ ← matAdd u₃ p₅
+  return (Matrix.assemble u₁ u₅ u₆ u₇)
+
 -- Example matrices
 private def matA : Matrix 2 3 := ⟨fun i j =>
   #[#[(1 : Int), 2, 3], #[4, 5, 6]][i.val]![j.val]!⟩
@@ -359,6 +542,38 @@ def main : IO Unit := do
   IO.println s!"A (2×3) ={matA}"
   IO.println s!"B (3×2) ={matB}"
   IO.println s!"A · B   ={matMulExample.val}  (cost: {((101 * 3) * 2) * 2})"
+  IO.println ""
+
+  IO.println "--- Strassen vs standard for 2×2 · 2×2 ---"
+  let sa : Matrix 2 2 := ⟨fun i j => #[#[(1:Int), 2], #[3, 4]][i.val]![j.val]!⟩
+  let sb : Matrix 2 2 := ⟨fun i j => #[#[(5:Int), 6], #[7, 8]][i.val]![j.val]!⟩
+  let std22     := costlyMatMul sa sb      -- cost 808
+  let strassen  := strassenMul sa sb       -- cost 718
+  let winograd  := strassenWinogradMul sa sb -- cost 715
+  IO.println s!"A ={sa}"
+  IO.println s!"B ={sb}"
+  IO.println s!"standard (cost  808) ={std22.val}"
+  IO.println s!"strassen (cost  718) ={strassen.val}"
+  IO.println s!"winograd (cost  715) ={winograd.val}"
+  IO.println ""
+
+  IO.println "--- Recursive Strassen for 4×4 · 4×4 ---"
+  let a4 : Matrix 4 4 := ⟨fun i j =>
+    #[#[(1:Int),2,3,4],#[5,6,7,8],#[9,10,11,12],#[13,14,15,16]][i.val]![j.val]!⟩
+  let b4 : Matrix 4 4 := ⟨fun i j =>
+    #[#[(17:Int),18,19,20],#[21,22,23,24],#[25,26,27,28],#[29,30,31,32]][i.val]![j.val]!⟩
+  let std44      := costlyMatMul a4 b4     -- cost ((101*4)*4)*4 = 6464
+  let strassen44 := strassenMul44 a4 b4    -- cost 5065
+  IO.println s!"A (4×4) ={a4}"
+  IO.println s!"B (4×4) ={b4}"
+  IO.println s!"standard  (cost 6464) ={std44.val}"
+  IO.println s!"strassen² (cost 5065) ={strassen44.val}"
+  IO.println s!"match: {std44.val.get 0 0 == strassen44.val.get 0 0 &&
+    std44.val.get 0 1 == strassen44.val.get 0 1 &&
+    std44.val.get 1 0 == strassen44.val.get 1 0 &&
+    std44.val.get 1 1 == strassen44.val.get 1 1 &&
+    std44.val.get 2 2 == strassen44.val.get 2 2 &&
+    std44.val.get 3 3 == strassen44.val.get 3 3}"
   IO.println ""
 
   IO.println "All costs are enforced at compile time. Zero runtime overhead."

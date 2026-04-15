@@ -18,3 +18,6 @@ lean_lib TypeDrivenDev
 lean_exe «type-driven-dev» where
   root := `Main
   moreLinkArgs := run_io (pkgConfig "openssl" "--libs")
+
+lean_exe «tensor-search» where
+  root := `TypeDrivenDev.TensorSearch
